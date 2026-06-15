@@ -1,4 +1,17 @@
-Guillermo_Hughes_Cardona/__pycache__/
-Guillermo_Hughes_Cardona/solution_1.py
-Guillermo_Hughes_Cardona/solution_2.py
-Guillermo_Hughes_Cardona/solution_3.py
+__pycache__/
+*.pyc
+*.csv
+*.log
+
+# LaTeX temporary files
+*.aux
+*.toc
+*.out
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Local experimental material not intended for final delivery repo
+Guillermo_Hughes_Cardona/experiments/

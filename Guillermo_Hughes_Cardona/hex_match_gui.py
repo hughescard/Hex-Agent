@@ -17,7 +17,7 @@ from board import HexBoard
 
 
 DEFAULT_AGENT_1 = APP_DIR / "solution.py"
-DEFAULT_AGENT_2 = APP_DIR / "solution_Camilo.py"
+DEFAULT_AGENT_2 = APP_DIR / "solution.py"
 MIN_BOARD_SIZE = 3
 MAX_BOARD_SIZE = 11
 

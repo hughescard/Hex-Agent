@@ -848,13 +848,39 @@ class HexHeuristicMixin:
     # Shared heuristic bias for MCTS
     # =========================================================
 
-    def heuristic_move_score_for_player(self, board: HexBoard, move: Cell, player: int) -> float:
-        """Rank a move using lightweight tactical and structural heuristics."""
+    def quick_move_score_for_player(self, board: HexBoard, move: Cell, player: int) -> float:
+        """Return a cheap positional score used when the clock is nearly exhausted."""
         if board.board[move[0]][move[1]] != 0:
             return float("-inf")
 
         enemy = self.opponent_id(player)
-        threat_cells = set(self.immediate_threat_cells_for_player(board, player))
+        score = 20.0 * self.cell_goal_progress(board, move, player)
+        for nr, nc in board.get_neighbors(*move):
+            if board.board[nr][nc] == player:
+                score += 18.0
+            elif board.board[nr][nc] == enemy:
+                score += 10.0
+        return score
+
+    def heuristic_move_score_for_player(
+        self,
+        board: HexBoard,
+        move: Cell,
+        player: int,
+        deadline: Optional[float] = None,
+    ) -> float:
+        """Rank a move using tactical and structural heuristics with time-aware degradation."""
+        if board.board[move[0]][move[1]] != 0:
+            return float("-inf")
+
+        enemy = self.opponent_id(player)
+        if deadline is not None and self.remaining_time(deadline) <= 0.002:
+            return self.quick_move_score_for_player(board, move, player)
+
+        threat_cells: set[Cell] = set()
+        if deadline is None or self.remaining_time(deadline) > 0.010:
+            threat_cells = set(self.immediate_threat_cells_for_player(board, player))
+
         score = 0.0
         score += 35.0 * self.cell_goal_progress(board, move, player)
 
@@ -865,11 +891,15 @@ class HexHeuristicMixin:
         if move in threat_cells:
             score += 80000.0
 
-        bridge_block = self.block_enemy_bridge_for_player(board, player)
+        bridge_block = None
+        if deadline is None or self.remaining_time(deadline) > 0.008:
+            bridge_block = self.block_enemy_bridge_for_player(board, player)
         if bridge_block == move:
             score += 12000.0
 
-        build_move = self.build_my_bridge_for_player(board, player)
+        build_move = None
+        if deadline is None or self.remaining_time(deadline) > 0.008:
+            build_move = self.build_my_bridge_for_player(board, player)
         if build_move == move:
             score += 9000.0
 
@@ -889,85 +919,109 @@ class HexHeuristicMixin:
 
         return score
 
-    def ordered_moves_for_player(self, board: HexBoard, player: int) -> list[Cell]:
+    def ordered_moves_for_player(
+        self,
+        board: HexBoard,
+        player: int,
+        deadline: Optional[float] = None,
+    ) -> list[Cell]:
         """Return all legal moves ordered by heuristic value."""
         moves = self.all_empty_cells(board)
         moves.sort(
             key=lambda move: (
-                self.heuristic_move_score_for_player(board, move, player),
+                self.heuristic_move_score_for_player(board, move, player, deadline),
                 random.random(),
             ),
             reverse=True,
         )
         return moves
 
-    def rollout_policy_move(self, board: HexBoard, player: int, top_k: int) -> Cell:
-        """Guided playout policy with light tactical bias."""
+    def fast_rollout_move_score_for_player(self, board: HexBoard, move: Cell, player: int) -> float:
+        """Return a cheap local score used only during rollouts."""
+        if board.board[move[0]][move[1]] != 0:
+            return float("-inf")
+
+        enemy = self.opponent_id(player)
+        score = 10.0 * self.cell_goal_progress(board, move, player)
+        own_neighbors = 0
+        enemy_neighbors = 0
+        active_neighbors = 0
+
+        for nr, nc in board.get_neighbors(*move):
+            value = board.board[nr][nc]
+            if value == player:
+                own_neighbors += 1
+                active_neighbors += 1
+            elif value == enemy:
+                enemy_neighbors += 1
+                active_neighbors += 1
+
+        score += 16.0 * own_neighbors
+        score += 11.0 * enemy_neighbors
+        score += 4.0 * active_neighbors
+
+        if own_neighbors <= 2 and self.cheap_move_creates_bridge(board, move, player):
+            score += 60.0
+
+        return score
+
+    def fast_rollout_moves_for_player(
+        self,
+        board: HexBoard,
+        player: int,
+        limit: Optional[int] = None,
+    ) -> list[Cell]:
+        """Return rollout candidates using only cheap local signals."""
+        legal_moves = self.valid_moves_near_action(board)
+        if not legal_moves:
+            legal_moves = self.all_empty_cells(board)
+
+        scored_moves = [
+            (
+                self.fast_rollout_move_score_for_player(board, move, player),
+                random.random(),
+                move,
+            )
+            for move in legal_moves
+        ]
+        scored_moves.sort(reverse=True)
+        ordered = [move for _score, _noise, move in scored_moves]
+
+        if limit is not None:
+            return ordered[:limit]
+        return ordered
+
+    def rollout_policy_move(
+        self,
+        board: HexBoard,
+        player: int,
+        top_k: int,
+        deadline: Optional[float] = None,
+    ) -> Cell:
+        """Cheap rollout policy: immediate tactics first, then fast randomized local play."""
+        start = time.perf_counter()
         move = self.immediate_winning_move_for_player(board, player)
         if move is not None:
+            self._mcts_stats["rollout_policy_call_count"] += 1
+            self._mcts_stats["rollout_policy_time_sum"] += time.perf_counter() - start
             return move
 
         move = self.immediate_block_move_for_player(board, player)
         if move is not None:
+            self._mcts_stats["rollout_policy_call_count"] += 1
+            self._mcts_stats["rollout_policy_time_sum"] += time.perf_counter() - start
             return move
 
-        move = self.block_enemy_bridge_for_player(board, player)
-        if move is not None:
-            return move
-
-        move = self.build_my_bridge_for_player(board, player)
-        if move is not None:
-            return move
-
-        ordered = self.ordered_moves_for_player(board, player)
+        ordered = self.fast_rollout_moves_for_player(board, player, self.rollout_move_limit)
         shortlist = ordered[: max(1, min(top_k, len(ordered)))]
-        return random.choice(shortlist)
+        if not shortlist:
+            shortlist = self.all_empty_cells(board)
 
-
-class SmartPlayer(HexHeuristicMixin, Player):
-    """Baseline heuristic player kept intact as a deterministic reference agent."""
-
-    def __init__(self, player_id: int):
-        super().__init__(player_id)
-        self.previous_board = None
-        self.debug = False
-
-    def play(self, board: HexBoard) -> Cell:
-        """Choose a move using strict tactical-to-strategic layer ordering."""
-        enemy_last_move = self.move_diff(self.previous_board, board)
-        if self.debug:
-            self.debug_log(f"enemy_last_move={enemy_last_move}")
-            self.debug_top_bridges("enemy_bridges", self.enemy_bridge_candidates(board))
-            own_candidates = self.bridge_candidates_for(board, self.player_id)
-            own_candidates.sort(key=lambda candidate: self.my_bridge_priority(board, candidate), reverse=True)
-            self.debug_top_bridges("my_bridges", own_candidates)
-
-        reason = "strategic_fallback_move"
-        move = self.immediate_winning_move(board)
-        if move is not None:
-            reason = "immediate_winning_move"
-        if move is None:
-            move = self.immediate_block_move(board)
-            if move is not None:
-                reason = "immediate_block_move"
-        if move is None:
-            move = self.defend_broken_bridge(board)
-            if move is not None:
-                reason = "defend_broken_bridge"
-        if move is None:
-            move = self.block_enemy_bridge(board)
-            if move is not None:
-                reason = "block_enemy_bridge"
-        if move is None:
-            move = self.build_my_bridge(board)
-            if move is not None:
-                reason = "build_my_bridge"
-        if move is None:
-            move = self.strategic_fallback_move(board)
-
-        self.debug_log(f"chosen_move={move} reason={reason}")
-        self.previous_board = self.clone_and_play(board, move, self.player_id)
-        return move
+        weights = [max(1.0, float(len(shortlist) - index)) for index, _move in enumerate(shortlist)]
+        chosen = random.choices(shortlist, weights=weights, k=1)[0]
+        self._mcts_stats["rollout_policy_call_count"] += 1
+        self._mcts_stats["rollout_policy_time_sum"] += time.perf_counter() - start
+        return chosen
 
 
 class _MCTSNode:
@@ -1013,6 +1067,9 @@ class SmartPlayerMCTS(HexHeuristicMixin, Player):
         exploration_c: float = 1.2,
         rollout_top_k: int = 6,
         max_rollout_depth: int = 80,
+        root_move_limit: int = 10,
+        node_move_limit: int = 8,
+        rollout_move_limit: int = 6,
         debug: bool = False,
     ):
         super().__init__(player_id)
@@ -1021,7 +1078,123 @@ class SmartPlayerMCTS(HexHeuristicMixin, Player):
         self.exploration_c = exploration_c
         self.rollout_top_k = rollout_top_k
         self.max_rollout_depth = max_rollout_depth
+        self.root_move_limit = root_move_limit
+        self.node_move_limit = node_move_limit
+        self.rollout_move_limit = rollout_move_limit
         self.debug = debug
+        self._last_rollout_cutoffs = 0
+        self._mcts_stats: dict[str, Any] = {}
+
+    def reset_mcts_stats(self) -> None:
+        """Reset per-turn MCTS counters."""
+        self._mcts_stats = {
+            "mcts_iterations": 0,
+            "completed_rollouts": 0,
+            "cutoff_rollouts_by_time": 0,
+            "cutoff_rollouts_by_depth": 0,
+            "rollout_depth_sum": 0,
+            "max_rollout_depth_reached": 0,
+            "terminal_rollouts_without_cutoff": 0,
+            "heuristic_cutoff_evaluations_for_player1": 0,
+            "heuristic_cutoff_evaluations_for_player2": 0,
+            "root_visits": 0,
+            "top_children": [],
+            "root_preparation_time": 0.0,
+            "node_creation_count": 0,
+            "node_creation_time_sum": 0.0,
+            "ordered_move_generation_count": 0,
+            "ordered_move_generation_time_sum": 0.0,
+            "root_untried_moves_count": 0,
+            "rollout_policy_call_count": 0,
+            "rollout_policy_time_sum": 0.0,
+        }
+
+    def cheap_move_creates_bridge(self, board: HexBoard, move: Cell, player: int) -> bool:
+        """Cheap local bridge probe used only for MCTS move ordering."""
+        if board.board[move[0]][move[1]] != 0:
+            return False
+
+        two_hop: set[Cell] = set()
+        for nr, nc in board.get_neighbors(*move):
+            for rr, cc in board.get_neighbors(nr, nc):
+                candidate = (rr, cc)
+                if candidate == move or board.board[rr][cc] != player:
+                    continue
+                two_hop.add(candidate)
+
+        for anchor in two_hop:
+            if self.bridge_supports(board, move, anchor) is not None:
+                return True
+        return False
+
+    def fast_move_score_for_player(self, board: HexBoard, move: Cell, player: int) -> float:
+        """Return a cheap move score tailored for MCTS node expansion."""
+        if board.board[move[0]][move[1]] != 0:
+            return float("-inf")
+
+        enemy = self.opponent_id(player)
+        score = 8.0 * self.cell_goal_progress(board, move, player)
+
+        clone = self.clone_and_play(board, move, player)
+        if clone.check_connection(player):
+            score += 100000.0
+
+        enemy_clone = self.clone_and_play(board, move, enemy)
+        if enemy_clone.check_connection(enemy):
+            score += 80000.0
+
+        own_neighbors = 0
+        enemy_neighbors = 0
+        for nr, nc in board.get_neighbors(*move):
+            if board.board[nr][nc] == player:
+                own_neighbors += 1
+            elif board.board[nr][nc] == enemy:
+                enemy_neighbors += 1
+
+        score += 30.0 * own_neighbors
+        score += 18.0 * enemy_neighbors
+
+        if own_neighbors <= 2 and self.cheap_move_creates_bridge(board, move, player):
+            score += 140.0
+
+        return score
+
+    def fast_ordered_moves_for_player(
+        self,
+        board: HexBoard,
+        player: int,
+        limit: Optional[int] = None,
+    ) -> list[Cell]:
+        """Return a cheap, diversity-preserving move order for MCTS."""
+        start = time.perf_counter()
+        legal_moves = self.valid_moves_near_action(board)
+        if not legal_moves:
+            legal_moves = self.all_empty_cells(board)
+
+        scored_moves = [
+            (
+                self.fast_move_score_for_player(board, move, player),
+                random.random(),
+                move,
+            )
+            for move in legal_moves
+        ]
+        scored_moves.sort(reverse=True)
+        ordered = [move for _score, _noise, move in scored_moves]
+
+        if limit is not None and len(ordered) > limit:
+            top_band = ordered[:limit]
+            diversity_band = ordered[limit : min(len(ordered), limit + max(2, limit // 2))]
+            if diversity_band:
+                random.shuffle(diversity_band)
+                keep = max(1, min(len(diversity_band), limit // 4))
+                top_band = self.dedupe_cells(top_band[: limit - keep] + diversity_band[:keep])
+            ordered = top_band[:limit]
+
+        elapsed = time.perf_counter() - start
+        self._mcts_stats["ordered_move_generation_count"] += 1
+        self._mcts_stats["ordered_move_generation_time_sum"] += elapsed
+        return ordered
 
     def create_node(
         self,
@@ -1029,14 +1202,21 @@ class SmartPlayerMCTS(HexHeuristicMixin, Player):
         player_to_move: int,
         parent: Optional[_MCTSNode] = None,
         move_from_parent: Optional[Cell] = None,
+        deadline: Optional[float] = None,
     ) -> _MCTSNode:
         """Create a node with heuristically ordered legal moves."""
+        start = time.perf_counter()
+        move_limit = self.root_move_limit if parent is None else self.node_move_limit
+        untried_moves = self.fast_ordered_moves_for_player(board, player_to_move, move_limit)
+        elapsed = time.perf_counter() - start
+        self._mcts_stats["node_creation_count"] += 1
+        self._mcts_stats["node_creation_time_sum"] += elapsed
         return _MCTSNode(
             board=board,
             player_to_move=player_to_move,
             parent=parent,
             move_from_parent=move_from_parent,
-            untried_moves=self.ordered_moves_for_player(board, player_to_move),
+            untried_moves=untried_moves,
         )
 
     def uct_score(self, parent_visits: int, child: _MCTSNode) -> float:
@@ -1051,7 +1231,7 @@ class SmartPlayerMCTS(HexHeuristicMixin, Player):
         """Select the next node using UCT."""
         return max(node.children, key=lambda child: self.uct_score(max(1, node.visits), child))
 
-    def expand(self, node: _MCTSNode) -> _MCTSNode:
+    def expand(self, node: _MCTSNode, deadline: Optional[float] = None) -> _MCTSNode:
         """Expand one untried move from the node."""
         move = node.untried_moves.pop(0)
         child_board = self.clone_and_play(node.board, move, node.player_to_move)
@@ -1060,34 +1240,132 @@ class SmartPlayerMCTS(HexHeuristicMixin, Player):
             player_to_move=self.opponent_id(node.player_to_move),
             parent=node,
             move_from_parent=move,
+            deadline=deadline,
         )
         node.children.append(child)
         return child
 
-    def simulate(self, board: HexBoard, player_to_move: int) -> int:
-        """Run a guided rollout and return the winner id, or 0 if unresolved."""
+    def time_exceeded(self, deadline: float) -> bool:
+        """Return True if the current deadline has been reached."""
+        return time.perf_counter() >= deadline
+
+    def remaining_time(self, deadline: float) -> float:
+        """Return the remaining time budget in seconds."""
+        return deadline - time.perf_counter()
+
+    def rollout_axis_progress_score(self, board: HexBoard, player: int) -> float:
+        """Measure how much the player's current stones advance along the winning axis."""
+        total = 0.0
+        count = 0
+        for row in range(board.size):
+            for col in range(board.size):
+                if board.board[row][col] != player:
+                    continue
+                total += self.cell_goal_progress(board, (row, col), player)
+                count += 1
+        if count == 0:
+            return 0.0
+        return total / count
+
+    def evaluate_rollout_cutoff(self, board: HexBoard, root_player: int) -> int:
+        """Estimate a winner at rollout cutoff from a symmetric root-vs-enemy evaluation.
+
+        The heuristic score compares root player and opponent using:
+        - shortest connection cost difference
+        - live bridge difference
+        - average axial progress difference
+
+        Positive score favors the root player, negative score favors the opponent,
+        and near-zero scores are treated as neutral draws for root-centric backpropagation.
+        """
+        winner = self.winner_on_board(board)
+        if winner != 0:
+            return winner
+        if self.board_full(board):
+            return 0
+
+        enemy = self.opponent_id(root_player)
+        my_cost, _my_path, _my_empties = self.shortest_connection_path(board, root_player)
+        enemy_cost, _enemy_path, _enemy_empties = self.shortest_connection_path(board, enemy)
+        my_bridges = len(self.live_bridges(board, root_player))
+        enemy_bridges = len(self.live_bridges(board, enemy))
+        my_axis = self.rollout_axis_progress_score(board, root_player)
+        enemy_axis = self.rollout_axis_progress_score(board, enemy)
+
+        cost_term = 1.6 * (enemy_cost - my_cost)
+        bridge_term = 0.55 * (my_bridges - enemy_bridges)
+        axis_term = 0.04 * (my_axis - enemy_axis)
+        score = cost_term + bridge_term + axis_term
+
+        if score > 0.35:
+            winner = root_player
+        elif score < -0.35:
+            winner = enemy
+        else:
+            winner = 0
+
+        if winner == 1:
+            self._mcts_stats["heuristic_cutoff_evaluations_for_player1"] += 1
+        elif winner == 2:
+            self._mcts_stats["heuristic_cutoff_evaluations_for_player2"] += 1
+
+        return winner
+
+    def simulate(
+        self,
+        board: HexBoard,
+        player_to_move: int,
+        deadline: float,
+        root_player: int,
+    ) -> tuple[int, bool, str, int]:
+        """Run a guided rollout and return winner, cutoff flag, reason and reached depth."""
         current_player = player_to_move
         depth = 0
 
         while depth < self.max_rollout_depth:
+            if self.time_exceeded(deadline):
+                return self.evaluate_rollout_cutoff(board, root_player), True, "time", depth
+
             winner = self.winner_on_board(board)
             if winner != 0:
-                return winner
+                return winner, False, "winner", depth
             if self.board_full(board):
-                return 0
+                return 0, False, "full", depth
 
-            move = self.rollout_policy_move(board, current_player, self.rollout_top_k)
+            move = self.rollout_policy_move(board, current_player, self.rollout_top_k, deadline)
             if board.place_piece(move[0], move[1], current_player) is False:
                 legal = self.all_empty_cells(board)
                 if not legal:
-                    return 0
+                    return 0, False, "full", depth
                 move = random.choice(legal)
                 board.place_piece(move[0], move[1], current_player)
 
             current_player = self.opponent_id(current_player)
             depth += 1
 
-        return self.winner_on_board(board)
+        winner = self.winner_on_board(board)
+        if winner != 0:
+            return winner, False, "winner", depth
+        return self.evaluate_rollout_cutoff(board, root_player), True, "depth", depth
+
+    def record_rollout_stats(self, winner: int, was_cutoff: bool, reason: str, depth: int) -> None:
+        """Update per-turn rollout counters."""
+        self._mcts_stats["rollout_depth_sum"] += depth
+        self._mcts_stats["max_rollout_depth_reached"] = max(
+            self._mcts_stats["max_rollout_depth_reached"],
+            depth,
+        )
+
+        if was_cutoff:
+            if reason == "time":
+                self._mcts_stats["cutoff_rollouts_by_time"] += 1
+            elif reason == "depth":
+                self._mcts_stats["cutoff_rollouts_by_depth"] += 1
+            return
+
+        self._mcts_stats["completed_rollouts"] += 1
+        if reason in {"winner", "full"}:
+            self._mcts_stats["terminal_rollouts_without_cutoff"] += 1
 
     def backpropagate(self, node: _MCTSNode, winner: int, root_player: int) -> None:
         """Propagate root-centric wins and visit counts up the tree."""
@@ -1100,41 +1378,113 @@ class SmartPlayerMCTS(HexHeuristicMixin, Player):
                 current.wins += 0.5
             current = current.parent
 
-    def run_mcts(self, board: HexBoard) -> tuple[Cell, int, _MCTSNode]:
+    def run_mcts(self, board: HexBoard) -> tuple[Cell, int, int, _MCTSNode]:
         """Run MCTS from the current position until the time budget expires."""
-        root = self.create_node(board.clone(), self.player_id)
         deadline = time.perf_counter() + self.max_time
+        root_start = time.perf_counter()
+        root = self.create_node(board.clone(), self.player_id, deadline=deadline)
+        self._mcts_stats["root_preparation_time"] = time.perf_counter() - root_start
+        self._mcts_stats["root_untried_moves_count"] = len(root.untried_moves)
         iterations = 0
+        rollout_cutoffs = 0
 
-        while time.perf_counter() < deadline:
+        while not self.time_exceeded(deadline):
             node = root
 
             while node.fully_expanded() and node.children and not node.is_terminal():
+                if self.time_exceeded(deadline):
+                    winner = self.evaluate_rollout_cutoff(node.board, self.player_id)
+                    self.backpropagate(node, winner, self.player_id)
+                    self.record_rollout_stats(winner, True, "time", 0)
+                    rollout_cutoffs += 1
+                    iterations += 1
+                    break
                 node = self.select_child(node)
+            else:
+                if not self.time_exceeded(deadline) and not node.is_terminal() and node.untried_moves:
+                    node = self.expand(node, deadline)
 
-            if not node.is_terminal() and node.untried_moves:
-                node = self.expand(node)
+                if self.time_exceeded(deadline):
+                    winner = self.evaluate_rollout_cutoff(node.board, self.player_id)
+                    self.backpropagate(node, winner, self.player_id)
+                    self.record_rollout_stats(winner, True, "time", 0)
+                    rollout_cutoffs += 1
+                    iterations += 1
+                    continue
 
-            rollout_board = node.board.clone()
-            winner = self.simulate(rollout_board, node.player_to_move)
-            self.backpropagate(node, winner, self.player_id)
-            iterations += 1
+                rollout_board = node.board.clone()
+                winner, was_cutoff, reason, depth = self.simulate(
+                    rollout_board,
+                    node.player_to_move,
+                    deadline,
+                    self.player_id,
+                )
+                self.backpropagate(node, winner, self.player_id)
+                self.record_rollout_stats(winner, was_cutoff, reason, depth)
+                if was_cutoff:
+                    rollout_cutoffs += 1
+                iterations += 1
+
+        self._mcts_stats["mcts_iterations"] = iterations
+        self._mcts_stats["root_visits"] = root.visits
+        top_children = sorted(root.children, key=lambda child: child.visits, reverse=True)[:5]
+        self._mcts_stats["top_children"] = [
+            {
+                "move": child.move_from_parent,
+                "visits": child.visits,
+                "winrate": (child.wins / child.visits) if child.visits > 0 else 0.0,
+            }
+            for child in top_children
+        ]
 
         if not root.children:
             fallback = self.strategic_fallback_move(board)
-            return fallback, iterations, root
+            return fallback, iterations, rollout_cutoffs, root
 
         best_child = max(root.children, key=lambda child: child.visits)
-        return best_child.move_from_parent or self.strategic_fallback_move(board), iterations, root
+        return best_child.move_from_parent or self.strategic_fallback_move(board), iterations, rollout_cutoffs, root
 
-    def debug_root_summary(self, root: _MCTSNode, iterations: int, best_move: Cell) -> None:
+    def debug_root_summary(self, root: _MCTSNode, iterations: int, rollout_cutoffs: int, best_move: Cell, elapsed: float) -> None:
         """Print a compact root summary for the MCTS search."""
         if not self.debug:
             return
 
-        top_children = sorted(root.children, key=lambda child: child.visits, reverse=True)[:3]
+        stats = self._mcts_stats
+        total_rollouts = (
+            stats["completed_rollouts"]
+            + stats["cutoff_rollouts_by_time"]
+            + stats["cutoff_rollouts_by_depth"]
+        )
+        average_depth = stats["rollout_depth_sum"] / total_rollouts if total_rollouts > 0 else 0.0
+        average_node_creation_time = (
+            stats["node_creation_time_sum"] / stats["node_creation_count"]
+            if stats["node_creation_count"] > 0
+            else 0.0
+        )
+        average_ordered_move_generation_time = (
+            stats["ordered_move_generation_time_sum"] / stats["ordered_move_generation_count"]
+            if stats["ordered_move_generation_count"] > 0
+            else 0.0
+        )
+        average_rollout_policy_time = (
+            stats["rollout_policy_time_sum"] / stats["rollout_policy_call_count"]
+            if stats["rollout_policy_call_count"] > 0
+            else 0.0
+        )
+        top_children = sorted(root.children, key=lambda child: child.visits, reverse=True)[:5]
         if not top_children:
-            self.debug_log(f"mcts: iterations={iterations} best={best_move} children=none")
+            self.debug_log(
+                f"mcts: elapsed={elapsed:.4f}s root_prep={stats['root_preparation_time']:.4f}s "
+                f"root_moves={stats['root_untried_moves_count']} iterations={iterations} "
+                f"cutoffs={rollout_cutoffs} best={best_move} children=none"
+            )
+            self.debug_log(
+                f"mcts: node_create_avg={average_node_creation_time:.5f}s "
+                f"move_order_avg={average_ordered_move_generation_time:.5f}s "
+                f"rollout_policy_avg={average_rollout_policy_time:.5f}s "
+                f"nodes={stats['node_creation_count']} move_orders={stats['ordered_move_generation_count']} "
+                f"rollout_calls={stats['rollout_policy_call_count']}"
+            )
             return
 
         best_child = top_children[0]
@@ -1144,35 +1494,75 @@ class SmartPlayerMCTS(HexHeuristicMixin, Player):
             if child.visits > 0
         )
         self.debug_log(
-            f"mcts: iterations={iterations} best={best_move} best_visits={best_child.visits} top={summary}"
+            f"mcts: elapsed={elapsed:.4f}s root_prep={stats['root_preparation_time']:.4f}s "
+            f"root_moves={stats['root_untried_moves_count']} iterations={iterations} "
+            f"completed={stats['completed_rollouts']} "
+            f"cut_time={stats['cutoff_rollouts_by_time']} cut_depth={stats['cutoff_rollouts_by_depth']} "
+            f"avg_depth={average_depth:.1f} max_depth={stats['max_rollout_depth_reached']} "
+            f"best={best_move} best_visits={best_child.visits}"
+        )
+        self.debug_log(
+            f"mcts: root_visits={stats['root_visits']} terminal={stats['terminal_rollouts_without_cutoff']} "
+            f"node_create_avg={average_node_creation_time:.5f}s "
+            f"move_order_avg={average_ordered_move_generation_time:.5f}s "
+            f"rollout_policy_avg={average_rollout_policy_time:.5f}s "
+            f"cutoff_p1={stats['heuristic_cutoff_evaluations_for_player1']} "
+            f"cutoff_p2={stats['heuristic_cutoff_evaluations_for_player2']} top={summary}"
         )
 
     def play(self, board: HexBoard) -> Cell:
         """Use hard tactics first; otherwise use MCTS as the main decision engine."""
+        play_start = time.perf_counter()
+        self.reset_mcts_stats()
         move = self.immediate_winning_move(board)
         if move is not None:
             if self.debug:
-                self.debug_log(f"hard_tactic=immediate_winning_move move={move}")
+                elapsed = time.perf_counter() - play_start
+                self.debug_log(f"hard_tactic=immediate_winning_move move={move} elapsed={elapsed:.4f}s")
             self.previous_board = self.clone_and_play(board, move, self.player_id)
             return move
 
         move = self.immediate_block_move(board)
         if move is not None:
             if self.debug:
-                self.debug_log(f"hard_tactic=immediate_block_move move={move}")
+                elapsed = time.perf_counter() - play_start
+                self.debug_log(f"hard_tactic=immediate_block_move move={move} elapsed={elapsed:.4f}s")
             self.previous_board = self.clone_and_play(board, move, self.player_id)
             return move
 
         move = self.defend_broken_bridge(board)
         if move is not None:
             if self.debug:
-                self.debug_log(f"hard_tactic=defend_broken_bridge move={move}")
+                elapsed = time.perf_counter() - play_start
+                self.debug_log(f"hard_tactic=defend_broken_bridge move={move} elapsed={elapsed:.4f}s")
             self.previous_board = self.clone_and_play(board, move, self.player_id)
             return move
 
-        move, iterations, root = self.run_mcts(board)
+        move, iterations, rollout_cutoffs, root = self.run_mcts(board)
+        self._last_rollout_cutoffs = rollout_cutoffs
         if self.debug:
-            self.debug_root_summary(root, iterations, move)
+            elapsed = time.perf_counter() - play_start
+            self.debug_root_summary(root, iterations, rollout_cutoffs, move, elapsed)
 
         self.previous_board = self.clone_and_play(board, move, self.player_id)
         return move
+
+
+class SmartPlayer(SmartPlayerMCTS):
+    """Final delivery agent for the tournament.
+
+    This is the class expected by the project evaluator.
+    """
+
+    def __init__(self, player_id: int):
+        super().__init__(
+            player_id,
+            max_time=0.3,
+            exploration_c=1.2,
+            rollout_top_k=6,
+            max_rollout_depth=60,
+            root_move_limit=10,
+            node_move_limit=6,
+            rollout_move_limit=4,
+            debug=False,
+        )
